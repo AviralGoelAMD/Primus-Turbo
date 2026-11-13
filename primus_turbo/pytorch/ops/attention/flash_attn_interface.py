@@ -52,6 +52,10 @@ from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
     _sbhd_layout,
     resolve_flash_attn_backend,
+    rocke_dense_unsupported_reason,
+)
+from primus_turbo.pytorch.kernels.attention.attention_rocke_impl import (
+    flash_attn_sbhd_rocke_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
@@ -181,6 +185,52 @@ class FlashAttnFunc(torch.autograd.Function):
             # These kernels already return lse as [B, Hq, 1, Sq]; drop the singleton axis so it
             # matches the [B, Hq, Sq] every other backend hands back.
             return (out, lse.squeeze(2)) if return_lse else out
+
+        if backend == BackendType.ROCKE:
+            # apply() is reachable without the dispatcher, and an unhandled enum would otherwise
+            # fall through to AITER below: re-check the gate and refuse, never run another kernel.
+            reason = rocke_dense_unsupported_reason(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                sink=sink,
+                qkv_format=qkv_format,
+                return_softmax=return_softmax,
+            )
+            if reason is not None:
+                raise ValueError(f"rocKE flash-attn cannot take this call: {reason}")
+            q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+            # Forward on rocKE; the returned (out_s, lse) are exactly what the FlyDSL forward
+            # returns (out sbhd-contiguous, lse [B*Sq, Hq] fp32 natural-log, sink included), so
+            # the FlyDSL backward below consumes them unchanged. ctx.backend stays ROCKE; the
+            # backward dispatches ROCKE and FLYDSL to the same FlyDSL code.
+            out_s, lse = flash_attn_sbhd_rocke_forward_impl(
+                q_s,
+                k_s,
+                v_s,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                return_lse=True,
+                sink=sink,
+            )
+            B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
+                ctx.softmax_scale = softmax_scale
+                ctx.causal = causal
+                ctx.window_size = window_size
+                ctx.sink = sink
+                ctx.deterministic = deterministic
+                ctx.lse_shape = (B, Sq, Hq)
+            out = out_s.permute(1, 0, 2, 3)
+            return (out, lse.view(B, Sq, Hq).permute(0, 2, 1)) if return_lse else out
 
         if ctx.flydsl_gfx1250:
             # As for Triton: apply() is reachable without the gate.
@@ -388,7 +438,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 )
             return _flash_attn_grads(dq, dk, dv, None, None)
 
-        if ctx.backend == BackendType.FLYDSL:
+        if ctx.backend in (BackendType.FLYDSL, BackendType.ROCKE):
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             B, Sq, Hq = ctx.lse_shape
             grads = flash_attn_sbhd_flydsl_backward_impl(
