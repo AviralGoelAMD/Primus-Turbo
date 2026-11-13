@@ -46,6 +46,10 @@ from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_forward_impl,
     hipkittens_attn_supported_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_rocke_impl import (
+    flash_attn_sbhd_rocke_forward_impl,
+    rocke_attn_unsupported_reason,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as _triton_dense_forward,
 )
@@ -391,6 +395,79 @@ class DenseAttnFwdTritonBackend(KernelBackend):
         return (out, lse) if return_lse else out
 
 
+def rocke_dense_unsupported_reason(
+    q,
+    k=None,
+    v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=True,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    sink=None,
+    qkv_format="bshd",
+    return_softmax=False,
+    **kwargs,
+) -> Optional[str]:
+    """Why the ROCKE backend cannot take this call, or None. The one gate shared by
+    ``DenseAttnFwdRockeBackend.can_handle`` and ``FlashAttnFunc.forward``, so a call that reaches
+    the op layer pinned to ROCKE is checked exactly as the dispatcher checks it.
+
+    ROCKE's backward is FlyDSL's, so everything FlyDSL's gate demands applies (arch, bf16,
+    causal, sbhd, GQA group, fp32 sink, window >= 64) on top of rocKE's own limits.
+    """
+    if is_gfx1250():
+        return "gfx1250"
+    if k is None or v is None:
+        return "k/v missing"
+    if not _sbhd_layout(q, qkv_format):
+        return f"sbhd storage required, got {qkv_format}"
+    if return_softmax:
+        return "return_softmax"
+    if not _gqa_group_ok(q.shape[2], k.shape[2], q.shape[3]):
+        return "GQA group not supported by the FlyDSL backward"
+    if not _sink_ok(sink, q.shape[2]):
+        return "sink must be None or fp32 [Hq]"
+    if not _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes):
+        return "outside the FlyDSL gate the backward needs (gfx950, bf16, causal, D 64/128, window >= 64, no dropout/bias/alibi)"
+    qs, ks, vs = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+    return rocke_attn_unsupported_reason(qs, ks, vs, window_size, sink is not None)
+
+
+class DenseAttnFwdRockeBackend(KernelBackend):
+    """rocKE dense attention forward (proof of concept), backward on FlyDSL.
+
+    Pin-only: registered with ``autotune=False`` and last in the registry, behind AITER, whose gate
+    is a superset of this one, so it is neither a default nor a fallback. Choose it with
+    ``PRIMUS_TURBO_ATTN_BACKEND=ROCKE`` or ``GlobalBackendManager.set_attn_backend``.
+    """
+
+    @staticmethod
+    def can_handle(q, **kwargs) -> bool:
+        return rocke_dense_unsupported_reason(q, **kwargs) is None
+
+    @staticmethod
+    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, sink=None, **kwargs):
+        # Off the op layer's path (autotune timing), so the sbhd view is taken here too.
+        q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
+        res = flash_attn_sbhd_rocke_forward_impl(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_lse=return_lse,
+            sink=sink,
+        )
+        if return_lse:
+            out, lse = res
+            B, Sq, Hq = q.shape[1], q.shape[0], q.shape[2]
+            return out.permute(1, 0, 2, 3), lse.view(B, Sq, Hq).permute(0, 2, 1)
+        return res.permute(1, 0, 2, 3)
+
+
 class DenseAttnFwdGluonBackend(KernelBackend):
     @staticmethod
     def can_handle(
@@ -462,6 +539,7 @@ _DENSE_FWD_BACKENDS = {
     BackendType.HIPKITTENS: BackendEntry(DenseAttnFwdHipkittensBackend),
     BackendType.GLUON: BackendEntry(DenseAttnFwdGluonBackend, autotune=False),
     BackendType.TRITON: BackendEntry(DenseAttnFwdTritonBackend),
+    BackendType.ROCKE: BackendEntry(DenseAttnFwdRockeBackend, autotune=False),
 }
 
 

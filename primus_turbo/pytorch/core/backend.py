@@ -77,6 +77,9 @@ class BackendType(Enum):
     # launch (see is_gfx950()/hipkittens_attn_supported).
     HIPKITTENS = auto()
     GLUON = auto()
+    # rocKE dense attention (gfx950, forward only; the backward stays on FlyDSL). Proof of
+    # concept: only ever used when pinned, never by default or autotune.
+    ROCKE = auto()
 
 
 @dataclass
